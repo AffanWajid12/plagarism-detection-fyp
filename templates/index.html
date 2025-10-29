@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plagiarism Detection System</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>🧠 Plagiarism Detection Portal</h1>
+
+    <form action="{{ url_for('upload_files') }}" method="post" enctype="multipart/form-data">
+      <label>Select files to check (Python, C, Java, Text):</label><br><br>
+      <input type="file" name="files[]" multiple required>
+      <br><br>
+      <button type="submit">Upload & Detect</button>
+    </form>
+
+    {% if results %}
+      <h2>📊 Analysis Report</h2>
+      <p class="info-text">Showing results for {{ results|length }} uploaded file(s)</p>
+      
+      <div class="cards-container">
+        {% for filename, data in results.items() %}
+        <div class="report-card">
+          <div class="card-header">
+            <h3>📄 {{ filename }}</h3>
+          </div>
+          
+          <div class="card-body">
+            <!-- AI Detection Section -->
+            <div class="ai-detection">
+              <h4>🤖 AI-Written Likelihood</h4>
+              <div class="likelihood-bar">
+                <div class="likelihood-fill" style="width: {{ data.ai_likelihood }}%; 
+                     background-color: {% if data.ai_likelihood < 30 %}#28a745{% elif data.ai_likelihood < 60 %}#ffc107{% else %}#dc3545{% endif %};">
+                </div>
+              </div>
+              <p class="likelihood-text">
+                <strong>{{ data.ai_likelihood }}%</strong> 
+                {% if data.ai_likelihood < 30 %}
+                  <span class="badge badge-low">Low Risk</span>
+                {% elif data.ai_likelihood < 60 %}
+                  <span class="badge badge-medium">Medium Risk</span>
+                {% else %}
+                  <span class="badge badge-high">High Risk</span>
+                {% endif %}
+              </p>
+            </div>
+
+            <!-- Plagiarism Similarity Section -->
+            <div class="similarity-section">
+              <h4>🔍 Similarity with Other Files</h4>
+              {% if data.similarities %}
+                <table class="similarity-table">
+                  <thead>
+                    <tr>
+                      <th>Compared With</th>
+                      <th>Similarity</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for sim in data.similarities %}
+                    <tr>
+                      <td>{{ sim.compared_with }}</td>
+                      <td>{{ sim.similarity }}%</td>
+                      <td>
+                        {% if sim.similarity > 80 %}
+                          <span class="status-badge status-high">High</span>
+                        {% elif sim.similarity > 50 %}
+                          <span class="status-badge status-medium">Medium</span>
+                        {% else %}
+                          <span class="status-badge status-low">Low</span>
+                        {% endif %}
+                      </td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              {% else %}
+                <p class="no-comparison">No other files to compare with</p>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>
