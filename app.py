@@ -1,350 +1,277 @@
+# app.py — cleaned, deduplicated and fixed
 import os
 import re
-import ast
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from flask import Flask, render_template, request, redirect
+from difflib import SequenceMatcher
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer, util
-from transformers import AutoTokenizer, AutoModel
-import fitz  # PyMuPDF for PDF text extraction
-from docx import Document  # for DOCX text extraction (optional)
+from transformers import (
+    AutoTokenizer,
+    AutoModel,
+    AutoConfig,
+    PreTrainedModel
+)
+import fitz  # PyMuPDF
+from docx import Document
 
+# ---------------- Flask setup ----------------
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-here'
-UPLOAD_FOLDER = 'uploads'
+app.secret_key = "your-secret-key-here"
+UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ✅ Load models once
-essay_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-# Load UniXcoder (for main code similarity)
-import torch
+# ---------------- device & global models ----------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-from transformers import RobertaTokenizer, RobertaModel, AutoTokenizer, AutoModel
-# GraphCodeBERT model for semantic code embeddings
-graphcodebert_tokenizer = RobertaTokenizer.from_pretrained("microsoft/graphcodebert-base")
-graphcodebert_model = RobertaModel.from_pretrained("microsoft/graphcodebert-base").to(device)
 
-from transformers import RobertaTokenizer, RobertaModel
-import torch
+# Essay embedding model
+essay_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Load UniXcoder model + tokenizer once
-try:
-    unixcoder_tokenizer = RobertaTokenizer.from_pretrained("microsoft/unixcoder-base")
-    unixcoder_model = RobertaModel.from_pretrained("microsoft/unixcoder-base")
-except Exception as e:
-    print("[!] Failed to load UniXcoder:", e)
+# CodeBERT for semantic code embeddings (used if available)
+codebert_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+codebert_model = AutoModel.from_pretrained("microsoft/codebert-base").to(device)
+codebert_model.eval()
 
-# ---------------- File Text Extraction ----------------
-def extract_text_from_file(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    text = ""
-
-    try:
-        if ext == ".pdf":
-            with fitz.open(file_path) as pdf:
-                for page in pdf:
-                    text += page.get_text("text")
-
-        elif ext == ".docx":
-            doc = Document(file_path)
-            text = "\n".join([para.text for para in doc.paragraphs])
-
-        elif ext in [".txt", ".md", ".py", ".js", ".java", ".cpp", ".c", ".php"]:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-    except Exception as e:
-        print(f"[!] Error reading {file_path}: {e}")
-        text = ""
-
-    return text.strip()
-
-# ---------------- AI Detection Heuristics ----------------
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch.nn.functional as F
-
-
-code_ai_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-code_ai_model = AutoModelForSequenceClassification.from_pretrained("microsoft/codebert-base", num_labels=2).to(device)
-import torch
-import torch.nn as nn
-from transformers import AutoTokenizer, AutoConfig, AutoModel, PreTrainedModel
-
-# --- Desklib AI Detector Model Definition ---
+# Desklib AI detector model wrapper (PreTrainedModel subclass)
 class DesklibAIDetectionModel(PreTrainedModel):
     config_class = AutoConfig
 
     def __init__(self, config):
         super().__init__(config)
+        # instantiate base transformer from config
         self.model = AutoModel.from_config(config)
         self.classifier = nn.Linear(config.hidden_size, 1)
         self.init_weights()
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None):
         outputs = self.model(input_ids, attention_mask=attention_mask)
-        last_hidden_state = outputs[0]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, dim=1)
+        last_hidden = outputs[0]  # (batch, seq_len, hidden)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+        sum_emb = torch.sum(last_hidden * input_mask_expanded, dim=1)
         sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
-        pooled_output = sum_embeddings / sum_mask
-        logits = self.classifier(pooled_output)
+        pooled = sum_emb / sum_mask
+        logits = self.classifier(pooled)
         return {"logits": logits}
 
-# --- Initialize once globally ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ai_tokenizer = AutoTokenizer.from_pretrained("desklib/ai-text-detector-v1.01")
-ai_model = DesklibAIDetectionModel.from_pretrained("desklib/ai-text-detector-v1.01").to(device)
+# Load Desklib detector (model directory on HF)
+AI_MODEL_DIR = "desklib/ai-text-detector-v1.01"
+ai_tokenizer = AutoTokenizer.from_pretrained(AI_MODEL_DIR)
+ai_model = DesklibAIDetectionModel.from_pretrained(AI_MODEL_DIR).to(device)
+ai_model.eval()
 
-def detect_ai_likelihood(text):
-    """
-    Detects the likelihood that a given text was generated by AI.
-    Returns a score between 0 and 100.
-    """
-    if not text.strip():
-        return 0.0
-
+# ---------------- file text extraction ----------------
+def extract_text_from_file(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    text = ""
     try:
+        if ext == ".pdf":
+            with fitz.open(file_path) as pdf:
+                for p in pdf:
+                    text += p.get_text("text")
+        elif ext == ".docx":
+            doc = Document(file_path)
+            text = "\n".join([para.text for para in doc.paragraphs])
+        else:
+            # txt, md, code files, etc.
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+    except Exception as e:
+        print(f"[!] Error reading {file_path}: {e}")
+    return text.strip()
+
+# ---------------- AI detection ----------------
+def detect_ai_likelihood(text, max_len=1024, threshold_model_max=768):
+    """
+    Returns probability in [0.0, 100.0] that `text` is AI-generated using desklib model.
+    """
+    if not text or not text.strip():
+        return 0.0
+    try:
+        # truncate sensibly: the desklib model supports long max_length, but we keep it reasonable
         encoded = ai_tokenizer(
             text,
-            padding='max_length',
+            padding="max_length",
             truncation=True,
             max_length=512,
-            return_tensors='pt'
+            return_tensors="pt",
         )
-        input_ids = encoded['input_ids'].to(device)
-        attention_mask = encoded['attention_mask'].to(device)
+        for k in encoded:
+            encoded[k] = encoded[k].to(device)
 
-        ai_model.eval()
         with torch.no_grad():
-            outputs = ai_model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs["logits"]
-            probability = torch.sigmoid(logits).item()
-
-        # Convert to percentage
-        ai_score = round(probability * 100, 2)
-        return ai_score
-
+            outputs = ai_model(input_ids=encoded["input_ids"], attention_mask=encoded["attention_mask"])
+            logits = outputs["logits"]  # shape (batch, 1)
+            prob = torch.sigmoid(logits).squeeze().item()  # in [0,1]
+        return round(prob * 100.0, 2)
     except Exception as e:
         print(f"[AI Detector Error] {e}")
         return 0.0
 
-
-# ---------------- Essay Similarity ----------------
-def essay_similarity(file1, file2):
-    text1 = extract_text_from_file(file1)
-    text2 = extract_text_from_file(file2)
-    if not text1 or not text2:
+# ---------------- essay similarity ----------------
+def essay_similarity(path1, path2):
+    t1 = extract_text_from_file(path1)
+    t2 = extract_text_from_file(path2)
+    if not t1 or not t2:
+        return 0.0
+    try:
+        embeddings = essay_model.encode([t1, t2], convert_to_tensor=True)
+        sim = util.cos_sim(embeddings[0], embeddings[1]).item()
+        return round(sim * 100.0, 2)
+    except Exception as e:
+        print(f"[Essay similarity error] {e}")
         return 0.0
 
-    embeddings = essay_model.encode([text1, text2], batch_size=2, convert_to_tensor=True)
-    sim = util.cos_sim(embeddings[0], embeddings[1]).item()
-    return round(sim * 100, 2)
-
-# ---------------- Code Similarity (graphcodebert) ----------------
-#import torch
-import torch.nn.functional as F
-import re
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# ---------------- Improved GraphCodeBERT + Multi-Language Similarity ----------------
-
-import os, re, torch
-import torch.nn.functional as F
-from difflib import SequenceMatcher
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoTokenizer, AutoModel
-
-# ---------------- Code Normalization ----------------
-def normalize_multilang_code(code, ext):
-    """Remove comments, literals, and normalize whitespace for common languages."""
-    if ext in ['.py', '.js', '.java', '.cpp', '.c', '.php', '.rb', '.go', '.swift', '.ts', '.cs', '.kt']:
-        code = re.sub(r'//.*|#.*|/\*[\s\S]*?\*/', ' ', code)
-    code = re.sub(r'(\".*?\"|\'.*?\')', ' <STR> ', code)
-    code = re.sub(r'\b\d+(\.\d+)?\b', ' <NUM> ', code)
-    code = re.sub(r'\s+', ' ', code)
+# ---------------- code normalization & similarity primitives ----------------
+def normalize_multilang_code(code, ext=None):
+    # strip common comment patterns and normalize strings/numbers
+    code = re.sub(r'/\*[\s\S]*?\*/', " ", code)   # block comments
+    code = re.sub(r'//.*', " ", code)             # c/c++/js single-line
+    code = re.sub(r'#.*', " ", code)              # python/shell
+    code = re.sub(r'(\"\"\".*?\"\"\"|\'\'\'.*?\'\'\')', " <STR> ", code, flags=re.DOTALL)
+    code = re.sub(r'(\".*?\"|\'.*?\')', " <STR> ", code)
+    code = re.sub(r'\b\d+(\.\d+)?\b', " <NUM> ", code)
+    code = re.sub(r'\s+', " ", code)
     return code.strip()
 
-# ---------------- Basic Similarities ----------------
-def lexical_similarity(code1, code2):
-    """Compare literal text overlap using difflib (quick and human-readable)."""
-    return SequenceMatcher(None, code1, code2).ratio()
+def lexical_similarity(a, b):
+    return SequenceMatcher(None, a, b).ratio()
 
-def tfidf_similarity(code1, code2):
-    """Compute character-level cosine similarity."""
-    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5))
-    tfidf = vectorizer.fit_transform([code1, code2])
-    return cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+def tfidf_char_similarity(a, b):
+    v = TfidfVectorizer(analyzer="char_wb", ngram_range=(3,5))
+    tf = v.fit_transform([a, b])
+    return float(cosine_similarity(tf[0:1], tf[1:2])[0][0])
 
-def jaccard_similarity(code1, code2):
-    """Compare overlap in tokens (identifiers, keywords, etc.)."""
-    tokens1 = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', code1))
-    tokens2 = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', code2))
-    if not tokens1 or not tokens2:
+def jaccard_token_similarity(a, b):
+    t1 = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', a))
+    t2 = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', b))
+    if not t1 or not t2:
         return 0.0
-    return len(tokens1 & tokens2) / len(tokens1 | tokens2)
+    return len(t1 & t2) / len(t1 | t2)
 
-# ---------------- CodeBERT Semantic Similarity ----------------
-# Load once globally
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-model = AutoModel.from_pretrained("microsoft/codebert-base").to(device)
-model.eval()
-
-def codebert_similarity(code1, code2):
-    """Deep semantic similarity via CodeBERT embeddings."""
+def codebert_similarity(a, b):
     try:
-        inputs = tokenizer([code1, code2], return_tensors="pt", truncation=True, padding=True, max_length=512)
+        inputs = codebert_tokenizer([a, b], return_tensors="pt", truncation=True, padding=True, max_length=512)
         for k in inputs:
             inputs[k] = inputs[k].to(device)
         with torch.no_grad():
-            outputs = model(**inputs).last_hidden_state.mean(dim=1)
-        sim = F.cosine_similarity(outputs[0].unsqueeze(0), outputs[1].unsqueeze(0)).item()
+            out = codebert_model(**inputs).last_hidden_state.mean(dim=1)  # (2, hidden)
+        sim = F.cosine_similarity(out[0].unsqueeze(0), out[1].unsqueeze(0)).item()
         return float(sim)
     except Exception as e:
-        print(f"[!] CodeBERT error: {e}")
+        # fail gracefully; return 0 semantic similarity
+        print(f"[CodeBERT error] {e}")
         return 0.0
 
-# ---------------- Combined Scoring ----------------
-def code_similarity(file1, file2, use_codebert=True):
-    """Hybrid local similarity combining lexical, TF-IDF, token overlap, and CodeBERT semantics."""
+def code_similarity(path1, path2, use_codebert=True):
     try:
-        ext1 = os.path.splitext(file1)[1].lower()
-        ext2 = os.path.splitext(file2)[1].lower()
+        ext1 = os.path.splitext(path1)[1].lower()
+        ext2 = os.path.splitext(path2)[1].lower()
 
-        with open(file1, 'r', encoding='utf-8', errors='ignore') as f1:
-            code1 = f1.read()
-        with open(file2, 'r', encoding='utf-8', errors='ignore') as f2:
-            code2 = f2.read()
+        with open(path1, "r", encoding="utf-8", errors="ignore") as f:
+            c1 = f.read()
+        with open(path2, "r", encoding="utf-8", errors="ignore") as f:
+            c2 = f.read()
 
-        code1 = normalize_multilang_code(code1, ext1)
-        code2 = normalize_multilang_code(code2, ext2)
+        c1n = normalize_multilang_code(c1, ext1)
+        c2n = normalize_multilang_code(c2, ext2)
 
-        lex_sim = lexical_similarity(code1, code2)
-        tfidf_sim = tfidf_similarity(code1, code2)
-        jaccard_sim = jaccard_similarity(code1, code2)
+        lex = lexical_similarity(c1n, c2n)
+        tfidf = tfidf_char_similarity(c1n, c2n)
+        jacc = jaccard_token_similarity(c1n, c2n)
+        sem = codebert_similarity(c1n, c2n) if use_codebert else 0.0
 
-        if use_codebert:
-            semantic_sim = codebert_similarity(code1, code2)
-        else:
-            semantic_sim = 0.0
-
-        # Weighted combination
-        score = (0.2 * lex_sim + 0.35 * tfidf_sim + 0.35 * jaccard_sim + 0.1 * semantic_sim) * 100
+        # Weighted blend (tunable)
+        score = (0.2 * lex + 0.35 * tfidf + 0.35 * jacc + 0.1 * sem) * 100.0
         return round(score, 2)
-
     except Exception as e:
-        print(f"[!] code_similarity exception: {e}")
+        print(f"[code_similarity error] {e}")
         return 0.0
 
-
-
-
-# --- debug helpers (use when investigating files like v1..v4) ---------------
+# ---------------- helper debug function ----------------
 def debug_compare_files(f1, f2):
-    with open(os.path.join(UPLOAD_FOLDER, f1), 'r', encoding='utf-8', errors='ignore') as a, \
-         open(os.path.join(UPLOAD_FOLDER, f2), 'r', encoding='utf-8', errors='ignore') as b:
-        t1 = a.read(); t2 = b.read()
-    print("----- PREVIEW", f1)
+    p1 = os.path.join(UPLOAD_FOLDER, f1)
+    p2 = os.path.join(UPLOAD_FOLDER, f2)
+    t1 = extract_text_from_file(p1)
+    t2 = extract_text_from_file(p2)
+    print("---- preview", f1)
     print(t1[:800])
-    print("----- PREVIEW", f2)
+    print("---- preview", f2)
     print(t2[:800])
-    print("tok lens:", len(graphcodebert_tokenizer.encode(t1, add_special_tokens=False)),
-          len(graphcodebert_tokenizer.encode(t2, add_special_tokens=False)))
-    print("AST norm (first 200 chars):", normalize_ast_for_similarity(t1)[:200])
-    print("AST norm (2):", normalize_ast_for_similarity(t2)[:200])
-    print("sanitized preview 1:", sanitize_code_text(t1)[:350])
-    print("sanitized preview 2:", sanitize_code_text(t2)[:350])
+    print("lex:", lexical_similarity(t1, t2))
+    try:
+        print("tfidf:", tfidf_char_similarity(t1, t2))
+    except Exception as e:
+        print("tfidf error", e)
 
-# ---------------- Plagiarism Detection ----------------
-# ---------------- Plagiarism Detection ----------------
-def detect_plagiarism(files_to_check):
+# ---------------- plagiarism detection orchestration ----------------
+def detect_plagiarism(files):
     results = {}
     file_data = {}
-
-    # 1️⃣ Read all files once
-    for file_name in files_to_check:
-        file_path = os.path.join(UPLOAD_FOLDER, file_name)
-        ext = os.path.splitext(file_path)[1].lower()
-        content = extract_text_from_file(file_path)
-        file_data[file_name] = {
-            'path': file_path,
-            'content': content,
-            'ext': ext
-        }
-
-    # 2️⃣ Initialize results
-    for file_name in files_to_check:
-        content = file_data[file_name]['content']
-        ai_likelihood = detect_ai_likelihood(content)
-
-
-
-        results[file_name] = {
-            'ai_likelihood': ai_likelihood,
-            'ai_risk_level': 'low' if ai_likelihood < 30 else 'medium' if ai_likelihood < 60 else 'high',
-            'similarities': []
-        }
-
-    # 3️⃣ Compute pairwise symmetric similarities (avoid double computation)
     pair_sims = {}
 
-    for i in range(len(files_to_check)):
-        for j in range(i + 1, len(files_to_check)):
-            f1, f2 = files_to_check[i], files_to_check[j]
-            data1, data2 = file_data[f1], file_data[f2]
+    # read all files once and compute ai-likelihood
+    for fn in files:
+        path = os.path.join(UPLOAD_FOLDER, fn)
+        ext = os.path.splitext(path)[1].lower()
+        content = extract_text_from_file(path)
+        file_data[fn] = {"path": path, "ext": ext, "content": content}
+        ai_score = detect_ai_likelihood(content)
+        results[fn] = {
+            "ai_likelihood": ai_score,
+            "ai_risk_level": "low" if ai_score < 30 else "medium" if ai_score < 60 else "high",
+            "similarities": []
+        }
 
+    # pairwise similarities (compute only once per pair)
+    for i in range(len(files)):
+        for j in range(i+1, len(files)):
+            f1, f2 = files[i], files[j]
+            d1, d2 = file_data[f1], file_data[f2]
             sim = 0.0
-            if not data1['content'] or not data2['content']:
+            if not d1["content"] or not d2["content"]:
                 sim = 0.0
-            elif data1['ext'] in ['.txt', '.md', '.docx', '.pdf'] or data2['ext'] in ['.txt', '.md', '.docx', '.pdf']:
-                sim = essay_similarity(data1['path'], data2['path'])
+            elif any(e in [".txt", ".md", ".docx", ".pdf"] for e in (d1["ext"], d2["ext"])):
+                # treat at least one as essay
+                sim = essay_similarity(d1["path"], d2["path"])
             else:
-                sim = code_similarity(data1['path'], data2['path'])
+                sim = code_similarity(d1["path"], d2["path"])
+            pair_sims[(f1, f2)] = pair_sims[(f2, f1)] = sim
 
-            # ✅ Store symmetric values
-            pair_sims[(f1, f2)] = sim
-            pair_sims[(f2, f1)] = sim
-
-    # 4️⃣ Populate results dictionary
-    for f1 in files_to_check:
-        for f2 in files_to_check:
+    # attach similarities back to results
+    for f1 in files:
+        for f2 in files:
             if f1 == f2:
                 continue
             sim = pair_sims.get((f1, f2), 0.0)
-            status = 'high' if sim > 80 else 'medium' if sim > 50 else 'low'
-            results[f1]['similarities'].append({
-                'compared_with': f2,
-                'similarity': sim,
-                'status': status
+            status = "high" if sim > 80 else "medium" if sim > 50 else "low"
+            results[f1]["similarities"].append({
+                "compared_with": f2,
+                "similarity": sim,
+                "status": status
             })
-
     return results
 
-
-# ---------------- Flask Routes ----------------
-@app.route('/')
+# ---------------- routes ----------------
+@app.route("/")
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
-@app.route('/upload', methods=['POST'])
+@app.route("/upload", methods=["POST"])
 def upload_files():
-    if 'files[]' not in request.files:
+    if "files[]" not in request.files:
         return redirect(request.url)
+    uploaded = request.files.getlist("files[]")
+    names = []
+    for f in uploaded:
+        if f.filename:
+            target = os.path.join(UPLOAD_FOLDER, f.filename)
+            f.save(target)
+            names.append(f.filename)
+    results = detect_plagiarism(names)
+    return render_template("index.html", results=results)
 
-    uploaded_files = request.files.getlist('files[]')
-    current_upload_files = []
-    for file in uploaded_files:
-        if file.filename:
-            file.save(os.path.join(UPLOAD_FOLDER, file.filename))
-            current_upload_files.append(file.filename)
-
-    results = detect_plagiarism(current_upload_files)
-    return render_template('index.html', results=results)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=False)
