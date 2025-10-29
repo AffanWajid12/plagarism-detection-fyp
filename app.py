@@ -27,6 +27,15 @@ from transformers import RobertaTokenizer, RobertaModel, AutoTokenizer, AutoMode
 graphcodebert_tokenizer = RobertaTokenizer.from_pretrained("microsoft/graphcodebert-base")
 graphcodebert_model = RobertaModel.from_pretrained("microsoft/graphcodebert-base").to(device)
 
+from transformers import RobertaTokenizer, RobertaModel
+import torch
+
+# Load UniXcoder model + tokenizer once
+try:
+    unixcoder_tokenizer = RobertaTokenizer.from_pretrained("microsoft/unixcoder-base")
+    unixcoder_model = RobertaModel.from_pretrained("microsoft/unixcoder-base")
+except Exception as e:
+    print("[!] Failed to load UniXcoder:", e)
 
 # ---------------- File Text Extraction ----------------
 def extract_text_from_file(file_path):
@@ -98,108 +107,136 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------- Improved GraphCodeBERT + Multi-Language Similarity ----------------
 
-# ---------------- Improved GraphCodeBERT Similarity ----------------
-# ---------------- Improved GraphCodeBERT + AST Hybrid Similarity ----------------
-import ast
+import os, re, torch
 import torch.nn.functional as F
-import re
-def normalize_ast(code):
-    """Convert Python code to an AST structure string (logic-level fingerprint)."""
+from difflib import SequenceMatcher
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import AutoTokenizer, AutoModel
+
+# ---------------- Code Normalization ----------------
+def normalize_multilang_code(code, ext):
+    """Remove comments, literals, and normalize whitespace for common languages."""
+    if ext in ['.py', '.js', '.java', '.cpp', '.c', '.php', '.rb', '.go', '.swift', '.ts', '.cs', '.kt']:
+        code = re.sub(r'//.*|#.*|/\*[\s\S]*?\*/', ' ', code)
+    code = re.sub(r'(\".*?\"|\'.*?\')', ' <STR> ', code)
+    code = re.sub(r'\b\d+(\.\d+)?\b', ' <NUM> ', code)
+    code = re.sub(r'\s+', ' ', code)
+    return code.strip()
+
+# ---------------- Basic Similarities ----------------
+def lexical_similarity(code1, code2):
+    """Compare literal text overlap using difflib (quick and human-readable)."""
+    return SequenceMatcher(None, code1, code2).ratio()
+
+def tfidf_similarity(code1, code2):
+    """Compute character-level cosine similarity."""
+    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5))
+    tfidf = vectorizer.fit_transform([code1, code2])
+    return cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0]
+
+def jaccard_similarity(code1, code2):
+    """Compare overlap in tokens (identifiers, keywords, etc.)."""
+    tokens1 = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', code1))
+    tokens2 = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', code2))
+    if not tokens1 or not tokens2:
+        return 0.0
+    return len(tokens1 & tokens2) / len(tokens1 | tokens2)
+
+# ---------------- CodeBERT Semantic Similarity ----------------
+# Load once globally
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+model = AutoModel.from_pretrained("microsoft/codebert-base").to(device)
+model.eval()
+
+def codebert_similarity(code1, code2):
+    """Deep semantic similarity via CodeBERT embeddings."""
     try:
-        # Normalize: remove docstrings
-        tree = ast.parse(code)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef, ast.Module)):
-                if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Str):
-                    node.body = node.body[1:]
-        
-        # Convert to string, ignoring specific field values
-        return ast.dump(tree, annotate_fields=False, include_attributes=False)
-    except Exception:
-        return ""  # fallback for syntax errors or non-Python code
-
-def graphcodebert_similarity(code1, code2):
-    def get_embedding(text):
-        # Clean comments & whitespace (this part is good)
-        text = re.sub(r'(#|//).*', '', text)
-        text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-        text = re.sub(r'\s+', ' ', text).strip()
-
-        if not text:
-             # Handle empty code after cleaning
-            return torch.zeros((1, 768), device=device)
-
-        inputs = graphcodebert_tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=512
-        ).to(device)
-
+        inputs = tokenizer([code1, code2], return_tensors="pt", truncation=True, padding=True, max_length=512)
+        for k in inputs:
+            inputs[k] = inputs[k].to(device)
         with torch.no_grad():
-            outputs = graphcodebert_model(**inputs)
-            emb = outputs.last_hidden_state.mean(dim=1)
-            emb = F.normalize(emb, p=2, dim=1)
-        return emb
+            outputs = model(**inputs).last_hidden_state.mean(dim=1)
+        sim = F.cosine_similarity(outputs[0].unsqueeze(0), outputs[1].unsqueeze(0)).item()
+        return float(sim)
+    except Exception as e:
+        print(f"[!] CodeBERT error: {e}")
+        return 0.0
 
-    # --- Semantic Embeddings (What the code *does*) ---
-    emb1 = get_embedding(code1)
-    emb2 = get_embedding(code2)
-    # Get similarity as a float between 0.0 and 1.0
-    sim_semantic = F.cosine_similarity(emb1, emb2).item()
+# ---------------- Combined Scoring ----------------
+def code_similarity(file1, file2, use_codebert=True):
+    """Hybrid local similarity combining lexical, TF-IDF, token overlap, and CodeBERT semantics."""
+    try:
+        ext1 = os.path.splitext(file1)[1].lower()
+        ext2 = os.path.splitext(file2)[1].lower()
 
-    # --- Structural Fingerprint via AST (How the code is *built*) ---
-    ast1_str = normalize_ast(code1)
-    ast2_str = normalize_ast(code2)
-    
-    sim_ast = 0.0
-    # Check if both files successfully parsed into an AST
-    ast_check_possible = bool(ast1_str and ast2_str)
-    
-    if ast_check_possible:
-        emb_ast1 = get_embedding(ast1_str)
-        emb_ast2 = get_embedding(ast2_str)
-        # Get AST similarity as a float between 0.0 and 1.0
-        sim_ast = F.cosine_similarity(emb_ast1, emb_ast2).item()
-    
-    # --- New Hybrid Score Logic ---
-    final_sim = 0.0
-    if ast_check_possible:
-        # **THIS IS THE FIX**
-        # We MULTIPLY the scores.
-        # If structure is different (low sim_ast), the final score
-        # is dragged down, even if semantics are similar.
-        final_sim = sim_semantic * sim_ast
-    else:
-        # Fallback for syntax errors or non-Python code.
-        # We can only trust the semantic score.
-        final_sim = sim_semantic
+        with open(file1, 'r', encoding='utf-8', errors='ignore') as f1:
+            code1 = f1.read()
+        with open(file2, 'r', encoding='utf-8', errors='ignore') as f2:
+            code2 = f2.read()
 
-    return round(final_sim * 100, 2)
+        code1 = normalize_multilang_code(code1, ext1)
+        code2 = normalize_multilang_code(code2, ext2)
 
+        lex_sim = lexical_similarity(code1, code2)
+        tfidf_sim = tfidf_similarity(code1, code2)
+        jaccard_sim = jaccard_similarity(code1, code2)
+
+        if use_codebert:
+            semantic_sim = codebert_similarity(code1, code2)
+        else:
+            semantic_sim = 0.0
+
+        # Weighted combination
+        score = (0.2 * lex_sim + 0.35 * tfidf_sim + 0.35 * jaccard_sim + 0.1 * semantic_sim) * 100
+        return round(score, 2)
+
+    except Exception as e:
+        print(f"[!] code_similarity exception: {e}")
+        return 0.0
+
+
+
+
+# --- debug helpers (use when investigating files like v1..v4) ---------------
+def debug_compare_files(f1, f2):
+    with open(os.path.join(UPLOAD_FOLDER, f1), 'r', encoding='utf-8', errors='ignore') as a, \
+         open(os.path.join(UPLOAD_FOLDER, f2), 'r', encoding='utf-8', errors='ignore') as b:
+        t1 = a.read(); t2 = b.read()
+    print("----- PREVIEW", f1)
+    print(t1[:800])
+    print("----- PREVIEW", f2)
+    print(t2[:800])
+    print("tok lens:", len(graphcodebert_tokenizer.encode(t1, add_special_tokens=False)),
+          len(graphcodebert_tokenizer.encode(t2, add_special_tokens=False)))
+    print("AST norm (first 200 chars):", normalize_ast_for_similarity(t1)[:200])
+    print("AST norm (2):", normalize_ast_for_similarity(t2)[:200])
+    print("sanitized preview 1:", sanitize_code_text(t1)[:350])
+    print("sanitized preview 2:", sanitize_code_text(t2)[:350])
+
+# ---------------- Plagiarism Detection ----------------
 # ---------------- Plagiarism Detection ----------------
 def detect_plagiarism(files_to_check):
     results = {}
-    file_data = {} # Will store content and extension
+    file_data = {}
 
-    # 1. Read all files and their content ONCE
+    # 1️⃣ Read all files once
     for file_name in files_to_check:
         file_path = os.path.join(UPLOAD_FOLDER, file_name)
         ext = os.path.splitext(file_path)[1].lower()
         content = extract_text_from_file(file_path)
         file_data[file_name] = {
+            'path': file_path,
             'content': content,
             'ext': ext
         }
 
-    # 2. Process and compare
-    for i, file_name in enumerate(files_to_check):
-        data = file_data[file_name]
-        content = data['content']
-        ext = data['ext']
-        
+    # 2️⃣ Initialize results
+    for file_name in files_to_check:
+        content = file_data[file_name]['content']
         ai_likelihood = detect_ai_likelihood(content)
         results[file_name] = {
             'ai_likelihood': ai_likelihood,
@@ -207,33 +244,41 @@ def detect_plagiarism(files_to_check):
             'similarities': []
         }
 
-        # Compare against all other files
-        for j, other_file in enumerate(files_to_check):
-            if i == j:
-                continue
-            
-            other_data = file_data[other_file]
-            other_content = other_data['content']
-            other_ext = other_data['ext'] # Use this for the check
+    # 3️⃣ Compute pairwise symmetric similarities (avoid double computation)
+    pair_sims = {}
+
+    for i in range(len(files_to_check)):
+        for j in range(i + 1, len(files_to_check)):
+            f1, f2 = files_to_check[i], files_to_check[j]
+            data1, data2 = file_data[f1], file_data[f2]
 
             sim = 0.0
-            if not content or not other_content:
+            if not data1['content'] or not data2['content']:
                 sim = 0.0
-            elif ext in ['.txt', '.md', '.docx', '.pdf']:
-                # Use the new text-based essay function
-                sim = essay_similarity(content, other_content)
+            elif data1['ext'] in ['.txt', '.md', '.docx', '.pdf'] or data2['ext'] in ['.txt', '.md', '.docx', '.pdf']:
+                sim = essay_similarity(data1['path'], data2['path'])
             else:
-                # *** THE FIX: Call the hybrid GraphCodeBERT + AST function ***
-                sim = graphcodebert_similarity(content, other_content) 
+                sim = code_similarity(data1['path'], data2['path'])
 
+            # ✅ Store symmetric values
+            pair_sims[(f1, f2)] = sim
+            pair_sims[(f2, f1)] = sim
+
+    # 4️⃣ Populate results dictionary
+    for f1 in files_to_check:
+        for f2 in files_to_check:
+            if f1 == f2:
+                continue
+            sim = pair_sims.get((f1, f2), 0.0)
             status = 'high' if sim > 80 else 'medium' if sim > 50 else 'low'
-            results[file_name]['similarities'].append({
-                'compared_with': other_file,
+            results[f1]['similarities'].append({
+                'compared_with': f2,
                 'similarity': sim,
                 'status': status
             })
 
     return results
+
 
 # ---------------- Flask Routes ----------------
 @app.route('/')
