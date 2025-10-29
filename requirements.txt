@@ -1,0 +1,9 @@
+fitz==0.0.1.dev2
+Flask==3.1.2
+matplotlib==3.10.7
+prettytable==3.16.0
+python_docx==1.2.0
+scikit_learn==1.7.2
+sentence_transformers==5.1.2
+torch==2.9.0
+transformers==4.57.1
